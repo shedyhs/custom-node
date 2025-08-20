@@ -1,28 +1,30 @@
 """
-WebSocket Image Save with Prompt ID - No Conflicts Version
-Custom nodes that don't conflict with existing ComfyUI nodes
-Place in: ComfyUI/custom_nodes/
+WebSocket Save with Real Prompt ID for ComfyUI
+Final version - Captures the actual prompt_id from the ComfyUI execution request
+GitHub: https://github.com/shedyhs/my-custom-nodes2
 """
 
 from PIL import Image
 import numpy as np
 import json
 import time
-import struct
+import os
+import inspect
+import threading
 
-# Safe import of ComfyUI modules
 try:
     import comfy.utils
+    import folder_paths
     COMFY_AVAILABLE = True
 except ImportError:
     COMFY_AVAILABLE = False
-    print("[WebSocketPromptID] Warning: comfy.utils not available")
+    print("[WebSocketSavePromptID] Warning: ComfyUI modules not available")
 
 
-class WSImageSavePromptID:
+class WebSocketSavePromptID:
     """
-    WebSocket Image Save with Prompt ID metadata
-    New node that doesn't conflict with existing nodes
+    Save images via WebSocket with the real prompt_id from the ComfyUI request.
+    The prompt_id is captured from the execution context and sent with each image.
     """
     
     @classmethod
@@ -32,237 +34,223 @@ class WSImageSavePromptID:
                 "images": ("IMAGE", ),
             },
             "optional": {
-                "prefix": ("STRING", {"default": "ComfyUI", "multiline": False}),
+                "filename_prefix": ("STRING", {"default": "ComfyUI", "multiline": False}),
+            },
+            "hidden": {
+                "prompt": "PROMPT",
+                "extra_pnginfo": "EXTRA_PNGINFO", 
+                "unique_id": "UNIQUE_ID"
             }
         }
     
     RETURN_TYPES = ()
     RETURN_NAMES = ()
-    FUNCTION = "execute"
+    FUNCTION = "save_via_websocket"
     OUTPUT_NODE = True
-    CATEGORY = "image/websocket"
+    CATEGORY = "image/output"
     
-    def execute(self, images, prefix="ComfyUI"):
+    def get_real_prompt_id(self):
+        """
+        Attempts to capture the real prompt_id from various sources in ComfyUI
+        """
+        prompt_id = None
+        
+        # Method 1: Try to get from execution module
+        if not prompt_id:
+            try:
+                import execution
+                # Check if there's a currently executing prompt
+                if hasattr(execution, 'PromptExecutor'):
+                    for attr in ['currently_executing', 'current_prompt', 'executing_prompt']:
+                        if hasattr(execution.PromptExecutor, attr):
+                            current = getattr(execution.PromptExecutor, attr)
+                            if current:
+                                if isinstance(current, (list, tuple)) and len(current) > 0:
+                                    prompt_id = str(current[0])
+                                elif isinstance(current, str):
+                                    prompt_id = current
+                                elif isinstance(current, dict) and 'prompt_id' in current:
+                                    prompt_id = current['prompt_id']
+                                if prompt_id:
+                                    print(f"[WebSocketSavePromptID] Found prompt_id from execution.{attr}: {prompt_id}")
+                                    break
+            except Exception as e:
+                pass
+        
+        # Method 2: Try to get from server module
+        if not prompt_id:
+            try:
+                from server import PromptServer
+                if hasattr(PromptServer, 'instance') and PromptServer.instance:
+                    server = PromptServer.instance
+                    # Check various possible attributes
+                    for attr in ['last_prompt_id', 'current_prompt_id', 'executing_prompt_id']:
+                        if hasattr(server, attr):
+                            pid = getattr(server, attr)
+                            if pid:
+                                prompt_id = str(pid)
+                                print(f"[WebSocketSavePromptID] Found prompt_id from server.{attr}: {prompt_id}")
+                                break
+            except Exception as e:
+                pass
+        
+        # Method 3: Inspect the call stack for prompt_id
+        if not prompt_id:
+            try:
+                frame = inspect.currentframe()
+                for _ in range(20):  # Check up to 20 frames up the stack
+                    if frame is None:
+                        break
+                    
+                    frame_locals = frame.f_locals
+                    frame_globals = frame.f_globals
+                    
+                    # Check locals
+                    if 'prompt_id' in frame_locals:
+                        pid = frame_locals['prompt_id']
+                        if pid and isinstance(pid, str):
+                            prompt_id = pid
+                            print(f"[WebSocketSavePromptID] Found prompt_id in stack locals: {prompt_id}")
+                            break
+                    
+                    # Check for objects containing prompt_id
+                    for var_name, var_value in frame_locals.items():
+                        if prompt_id:
+                            break
+                        
+                        # Check if object has prompt_id attribute
+                        if hasattr(var_value, 'prompt_id'):
+                            pid = getattr(var_value, 'prompt_id')
+                            if pid:
+                                prompt_id = str(pid)
+                                print(f"[WebSocketSavePromptID] Found prompt_id in {var_name}.prompt_id: {prompt_id}")
+                                break
+                        
+                        # Check if it's a dict with prompt_id
+                        if isinstance(var_value, dict):
+                            if 'prompt_id' in var_value:
+                                pid = var_value['prompt_id']
+                                if pid:
+                                    prompt_id = str(pid)
+                                    print(f"[WebSocketSavePromptID] Found prompt_id in dict {var_name}: {prompt_id}")
+                                    break
+                            # Also check for 'id' key
+                            elif 'id' in var_value and var_name in ['prompt', 'workflow', 'job']:
+                                pid = var_value['id']
+                                if pid and isinstance(pid, str) and len(pid) > 20:
+                                    prompt_id = str(pid)
+                                    print(f"[WebSocketSavePromptID] Found id in {var_name}: {prompt_id}")
+                                    break
+                    
+                    frame = frame.f_back
+                    
+            except Exception as e:
+                pass
+        
+        # Method 4: Check thread local storage
+        if not prompt_id:
+            try:
+                current_thread = threading.current_thread()
+                if hasattr(current_thread, 'prompt_id'):
+                    prompt_id = str(current_thread.prompt_id)
+                    print(f"[WebSocketSavePromptID] Found prompt_id in thread: {prompt_id}")
+            except Exception as e:
+                pass
+        
+        # Method 5: Try to get from global context
+        if not prompt_id:
+            try:
+                import __main__
+                if hasattr(__main__, 'prompt_id'):
+                    prompt_id = str(__main__.prompt_id)
+                    print(f"[WebSocketSavePromptID] Found prompt_id in __main__: {prompt_id}")
+            except Exception as e:
+                pass
+        
+        return prompt_id
+    
+    def save_via_websocket(self, images, filename_prefix="ComfyUI", 
+                          prompt=None, extra_pnginfo=None, unique_id=None):
+        """
+        Save images via WebSocket with metadata including the real prompt_id
+        """
+        
         if not COMFY_AVAILABLE:
-            print("[WSImageSavePromptID] Error: ComfyUI not available")
+            print("[WebSocketSavePromptID] Error: ComfyUI not available")
             return {}
         
-        # Generate unique prompt_id with timestamp
-        prompt_id = f"{prefix}_{int(time.time() * 1000)}"
+        # Get the real prompt_id from the execution context
+        prompt_id = self.get_real_prompt_id()
         
+        # If no prompt_id found, generate a fallback
+        if not prompt_id:
+            # Use timestamp-based fallback
+            prompt_id = f"noid_{int(time.time() * 1000)}"
+            print(f"[WebSocketSavePromptID] Warning: Could not find real prompt_id, using fallback: {prompt_id}")
+        else:
+            print(f"[WebSocketSavePromptID] Successfully captured real prompt_id: {prompt_id}")
+        
+        # Process and send images
         try:
             pbar = comfy.utils.ProgressBar(images.shape[0])
             
+            print(f"[WebSocketSavePromptID] Processing {images.shape[0]} image(s)")
+            
             for idx, image in enumerate(images):
-                # Convert tensor to numpy array
+                # Convert tensor to numpy array and then to PIL Image
                 img_numpy = image.cpu().numpy()
-                img_array = (255. * img_numpy).astype(np.uint8)
+                img_array = np.clip(img_numpy * 255.0, 0, 255).astype(np.uint8)
+                pil_image = Image.fromarray(img_array)
                 
-                # Clip values to valid range
-                img_array = np.clip(img_array, 0, 255)
-                
-                # Create PIL Image
-                img = Image.fromarray(img_array)
-                
-                # Prepare metadata
+                # Prepare metadata with the real prompt_id
                 metadata = {
-                    "prompt_id": prompt_id,
+                    "prompt_id": prompt_id,  # The real prompt_id from the request
+                    "node_id": str(unique_id) if unique_id else "unknown",
                     "image_index": idx,
                     "total_images": images.shape[0],
-                    "prefix": prefix,
+                    "filename_prefix": filename_prefix,
                     "timestamp": time.time(),
-                    "node_type": "WSImageSavePromptID"
+                    "timestamp_str": time.strftime("%Y%m%d_%H%M%S")
                 }
                 
                 # Convert metadata to JSON string
-                metadata_json = json.dumps(metadata)
+                metadata_json = json.dumps(metadata, ensure_ascii=False)
                 
-                # Send through WebSocket with metadata
-                pbar.update_absolute(idx, images.shape[0], ("PNG", img, metadata_json))
+                # Send via WebSocket: (format, image, metadata)
+                pbar.update_absolute(idx, images.shape[0], ("PNG", pil_image, metadata_json))
+                
+                print(f"[WebSocketSavePromptID] Sent image {idx+1}/{images.shape[0]} with prompt_id: {prompt_id}")
             
-            print(f"[WSImageSavePromptID] Sent {images.shape[0]} images with prompt_id: {prompt_id}")
+            print(f"[WebSocketSavePromptID] ✅ Successfully sent all images with prompt_id: {prompt_id}")
             
         except Exception as e:
-            print(f"[WSImageSavePromptID] Error: {e}")
+            print(f"[WebSocketSavePromptID] ❌ Error sending images: {e}")
+            import traceback
+            traceback.print_exc()
             return {}
         
         return {}
     
     @classmethod
     def IS_CHANGED(cls, **kwargs):
-        # Force re-execution every time
+        """
+        Force the node to always execute (never cache)
+        """
         return float("nan")
 
 
-class WSImageSaveMetadata:
-    """
-    WebSocket Image Save with Extended Metadata
-    Advanced version with more options
-    """
-    
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "images": ("IMAGE", ),
-            },
-            "optional": {
-                "prefix": ("STRING", {"default": "ComfyUI", "multiline": False}),
-                "add_timestamp": ("BOOLEAN", {"default": True}),
-                "add_counter": ("BOOLEAN", {"default": True}),
-            }
-        }
-    
-    RETURN_TYPES = ()
-    RETURN_NAMES = ()
-    FUNCTION = "execute"
-    OUTPUT_NODE = True
-    CATEGORY = "image/websocket"
-    
-    def execute(self, images, prefix="ComfyUI", add_timestamp=True, add_counter=True):
-        if not COMFY_AVAILABLE:
-            print("[WSImageSaveMetadata] Error: ComfyUI not available")
-            return {}
-        
-        # Build prompt_id
-        prompt_id_parts = [prefix]
-        if add_timestamp:
-            prompt_id_parts.append(str(int(time.time() * 1000)))
-        if add_counter:
-            prompt_id_parts.append(f"n{images.shape[0]}")
-        
-        prompt_id = "_".join(prompt_id_parts)
-        
-        try:
-            pbar = comfy.utils.ProgressBar(images.shape[0])
-            
-            for idx, image in enumerate(images):
-                # Process image
-                img_numpy = image.cpu().numpy()
-                img_array = np.clip(255. * img_numpy, 0, 255).astype(np.uint8)
-                img = Image.fromarray(img_array)
-                
-                # Rich metadata
-                metadata = {
-                    "prompt_id": prompt_id,
-                    "image_index": idx,
-                    "total_images": images.shape[0],
-                    "prefix": prefix,
-                    "timestamp": time.time(),
-                    "timestamp_str": time.strftime("%Y%m%d_%H%M%S"),
-                    "node_type": "WSImageSaveMetadata",
-                    "settings": {
-                        "add_timestamp": add_timestamp,
-                        "add_counter": add_counter
-                    }
-                }
-                
-                # Send with metadata
-                pbar.update_absolute(idx, images.shape[0], ("PNG", img, json.dumps(metadata)))
-            
-            print(f"[WSImageSaveMetadata] Sent {images.shape[0]} images with prompt_id: {prompt_id}")
-            
-        except Exception as e:
-            print(f"[WSImageSaveMetadata] Error: {e}")
-            return {}
-        
-        return {}
-    
-    @classmethod
-    def IS_CHANGED(cls, **kwargs):
-        return float("nan")
-
-
-class WSImageSaveBasic:
-    """
-    Basic WebSocket Image Save
-    Simple version without conflicts
-    """
-    
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "images": ("IMAGE", ),
-            }
-        }
-    
-    RETURN_TYPES = ()
-    RETURN_NAMES = ()
-    FUNCTION = "execute"
-    OUTPUT_NODE = True
-    CATEGORY = "image/websocket"
-    
-    def execute(self, images):
-        if not COMFY_AVAILABLE:
-            print("[WSImageSaveBasic] Error: ComfyUI not available")
-            return {}
-        
-        try:
-            pbar = comfy.utils.ProgressBar(images.shape[0])
-            
-            for idx, image in enumerate(images):
-                img_numpy = image.cpu().numpy()
-                img_array = np.clip(255. * img_numpy, 0, 255).astype(np.uint8)
-                img = Image.fromarray(img_array)
-                
-                # Send without metadata (compatible with original)
-                pbar.update_absolute(idx, images.shape[0], ("PNG", img, None))
-            
-            print(f"[WSImageSaveBasic] Sent {images.shape[0]} images")
-            
-        except Exception as e:
-            print(f"[WSImageSaveBasic] Error: {e}")
-            return {}
-        
-        return {}
-    
-    @classmethod
-    def IS_CHANGED(cls, images):
-        return float("nan")
-
-
-# Test node to verify installation
-class WSTestNode:
-    """Test node to verify custom nodes are loading"""
-    
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "text": ("STRING", {"default": "test", "multiline": False}),
-            }
-        }
-    
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("output",)
-    FUNCTION = "execute"
-    CATEGORY = "utils/test"
-    
-    def execute(self, text):
-        output = f"[WSTestNode] Received: {text}"
-        print(output)
-        return (output,)
-
-
-# IMPORTANT: Use unique names to avoid conflicts
+# Node registration
 NODE_CLASS_MAPPINGS = {
-    "WSImageSavePromptID": WSImageSavePromptID,
-    "WSImageSaveMetadata": WSImageSaveMetadata,
-    "WSImageSaveBasic": WSImageSaveBasic,
-    "WSTestNode": WSTestNode,
+    "WebSocketSavePromptID": WebSocketSavePromptID,
 }
 
-# Display names in the UI
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "WSImageSavePromptID": "WS Image Save (Prompt ID)",
-    "WSImageSaveMetadata": "WS Image Save (Metadata)",
-    "WSImageSaveBasic": "WS Image Save (Basic)",
-    "WSTestNode": "WS Test Node",
+    "WebSocketSavePromptID": "Save Image WebSocket (with Prompt ID)",
 }
 
-# Optional: Category icons (if supported by your ComfyUI version)
-WEB_DIRECTORY = "./web"
-
-print("[WebSocketPromptID] Custom nodes loaded successfully!")
-print(f"[WebSocketPromptID] Registered nodes: {list(NODE_CLASS_MAPPINGS.keys())}")
+# Confirmation message
+print("=" * 60)
+print("[WebSocketSavePromptID] Custom node loaded successfully!")
+print("[WebSocketSavePromptID] This node captures the real prompt_id")
+print("[WebSocketSavePromptID] from ComfyUI execution requests")
+print("=" * 60)
